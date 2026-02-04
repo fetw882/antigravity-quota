@@ -1,57 +1,88 @@
 #!/usr/bin/env node
 /**
  * Antigravity Quota Checker
- * 
- * Check quota status for all Antigravity accounts configured in Clawdbot.
- * 
- * Usage: 
+ *
+ * Usage:
  *   node check-quota.js [options]
- * 
+ *
  * Options:
- *   --table      Output markdown table (pipe to tablesnap for image)
- *   --json       Output JSON
- *   --tz ZONE    Timezone for reset times (default: local or TZ env)
- * 
+ *   --watch     Refresh every 5 minutes and show deltas
+ *   --table     Output ASCII table (default for non-JSON)
+ *   --json      Output JSON
+ *   --tz ZONE   Timezone for reset times (default: local or TZ env)
+ *   --help      Show help
+ *
  * Examples:
  *   node check-quota.js
- *   node check-quota.js --table | tablesnap --theme light -o quota.png
+ *   node check-quota.js --watch
  *   node check-quota.js --json
  *   TZ=America/New_York node check-quota.js
- * 
- * Quota Info:
- *   - Each model type (Claude, Gemini Pro, Gemini Flash) has its own 5-hour reset window
- *   - Quotas are per-account
- * 
- * Requires:
- *   - Clawdbot with Antigravity accounts configured
- *   - Auth profiles at ~/.openclaw/agents/main/agent/auth-profiles.json
- *     or ~/.openclaw/agent/auth-profiles.json
  */
 
 const fs = require('fs');
 const path = require('path');
 
 // OAuth credentials (Antigravity public client)
-const CLIENT_ID = Buffer.from("MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==", 'base64').toString();
-const CLIENT_SECRET = Buffer.from("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=", 'base64').toString();
-const TOKEN_URL = "https://oauth2.googleapis.com/token";
-const ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+const CLIENT_ID = Buffer.from(
+  'MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==',
+  'base64'
+).toString();
+const CLIENT_SECRET = Buffer.from(
+  'R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=',
+  'base64'
+).toString();
+const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const ENDPOINT = 'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels';
 
-// Parse args
-const args = process.argv.slice(2);
-const tableMode = args.includes('--table');
-const jsonMode = args.includes('--json');
-const tzIndex = args.indexOf('--tz');
-const timezone = tzIndex !== -1 ? args[tzIndex + 1] : (process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone);
-
-// Models to check
 const TARGET_MODELS = [
   'claude-opus-4-5-thinking',
-  'claude-sonnet-4-5-thinking', 
+  'claude-sonnet-4-5-thinking',
   'claude-sonnet-4-5',
-  'gemini-3-flash',
   'gemini-3-pro-high',
+  'gemini-3-flash',
 ];
+
+const MODEL_LABELS = {
+  'claude-opus-4-5-thinking': 'Claude Opus',
+  'claude-sonnet-4-5-thinking': 'Claude Sonnet T',
+  'claude-sonnet-4-5': 'Claude Sonnet',
+  'gemini-3-pro-high': 'Gemini Pro',
+  'gemini-3-flash': 'Gemini Flash',
+};
+
+const args = process.argv.slice(2);
+const watchMode = args.includes('--watch');
+const tableMode = args.includes('--table') || !args.includes('--json');
+const jsonMode = args.includes('--json');
+const helpMode = args.includes('--help') || args.includes('-h');
+const tzIndex = args.indexOf('--tz');
+const timezone = tzIndex !== -1
+  ? args[tzIndex + 1]
+  : (process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone);
+
+const REFRESH_MS = 5 * 60 * 1000;
+const BAN_REGEX = /banned|suspended|disabled/i;
+
+function showHelp() {
+  console.log(`Antigravity Quota Checker
+
+Usage:
+  node check-quota.js [options]
+
+Options:
+  --watch     Refresh every 5 minutes and show deltas
+  --table     Output ASCII table (default for non-JSON)
+  --json      Output JSON
+  --tz ZONE   Timezone for reset times (default: local or TZ env)
+  --help      Show help
+
+Examples:
+  node check-quota.js
+  node check-quota.js --watch
+  node check-quota.js --json
+  TZ=America/New_York node check-quota.js
+`);
+}
 
 async function refreshToken(refreshTokenValue) {
   const response = await fetch(TOKEN_URL, {
@@ -64,12 +95,16 @@ async function refreshToken(refreshTokenValue) {
       grant_type: 'refresh_token',
     }),
   });
-  
+
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Token refresh failed: ${response.status}`);
+    const ban = detectBan(text);
+    const err = new Error(`Token refresh failed: ${response.status}`);
+    err._banDetected = ban;
+    err._raw = text;
+    throw err;
   }
-  
+
   const data = await response.json();
   return data.access_token;
 }
@@ -80,17 +115,27 @@ async function fetchQuota(accessToken, projectId) {
     headers: {
       'Authorization': `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'antigravity/0.2.0',
+      'User-Agent': 'antigravity/0.3.0',
     },
     body: JSON.stringify({ project: projectId }),
   });
-  
+
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Quota fetch failed: ${response.status}`);
+    const ban = detectBan(text);
+    const err = new Error(`Quota fetch failed: ${response.status}`);
+    err._banDetected = ban;
+    err._raw = text;
+    throw err;
   }
-  
-  return response.json();
+
+  const data = await response.json();
+  return data;
+}
+
+function detectBan(text) {
+  if (!text) return false;
+  return BAN_REGEX.test(text);
 }
 
 function formatTime(isoString) {
@@ -99,8 +144,7 @@ function formatTime(isoString) {
     const date = new Date(isoString);
     const now = new Date();
     const hoursUntilReset = (date - now) / (1000 * 60 * 60);
-    
-    // If reset is more than 8 hours away, include the date
+
     if (hoursUntilReset > 8) {
       return date.toLocaleDateString('en-US', {
         timeZone: timezone,
@@ -108,15 +152,15 @@ function formatTime(isoString) {
         day: 'numeric',
         hour: 'numeric',
         minute: '2-digit',
-        hour12: true
+        hour12: true,
       });
     }
-    
-    return date.toLocaleTimeString('en-US', { 
-      timeZone: timezone, 
-      hour: 'numeric', 
+
+    return date.toLocaleTimeString('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
       minute: '2-digit',
-      hour12: true 
+      hour12: true,
     });
   } catch {
     return new Date(isoString).toLocaleTimeString();
@@ -125,31 +169,24 @@ function formatTime(isoString) {
 
 function formatQuota(models) {
   const results = [];
-  
+
   for (const modelId of TARGET_MODELS) {
     const model = models[modelId];
     if (model?.quotaInfo) {
-      // If remainingFraction is missing/null, quota is exhausted (0%)
       const fraction = model.quotaInfo.remainingFraction ?? 0;
-      const pct = (fraction * 100).toFixed(1);
-      results.push({ 
-        model: modelId, 
-        quota: parseFloat(pct), 
-        quotaStr: `${pct}%`, 
+      const pct = Number((fraction * 100).toFixed(1));
+      results.push({
+        model: modelId,
+        modelLabel: MODEL_LABELS[modelId] || modelId,
+        quota: pct,
+        quotaStr: `${pct.toFixed(1)}%`,
         reset: formatTime(model.quotaInfo.resetTime),
-        resetTime: model.quotaInfo.resetTime 
+        resetTime: model.quotaInfo.resetTime,
       });
     }
   }
-  
-  return results;
-}
 
-function getQuotaEmoji(pct) {
-  if (pct >= 80) return '🟢';
-  if (pct >= 50) return '🟡';
-  if (pct >= 20) return '🟠';
-  return '🔴';
+  return results;
 }
 
 function findAuthProfiles() {
@@ -157,35 +194,164 @@ function findAuthProfiles() {
     path.join(process.env.HOME, '.openclaw/agents/main/agent/auth-profiles.json'),
     path.join(process.env.HOME, '.openclaw/agent/auth-profiles.json'),
   ];
-  
+
   for (const p of possiblePaths) {
-    if (fs.existsSync(p)) {
-      return p;
-    }
+    if (fs.existsSync(p)) return p;
   }
-  
+
   return null;
 }
 
+function pad(str, len) {
+  const s = String(str);
+  if (s.length >= len) return s;
+  return s + ' '.repeat(len - s.length);
+}
+
+function renderTable(headers, rows) {
+  const widths = headers.map((h, i) =>
+    Math.max(
+      String(h).length,
+      ...rows.map(r => String(r[i] ?? '').length)
+    )
+  );
+
+  const line = '+' + widths.map(w => '-'.repeat(w + 2)).join('+') + '+';
+  const headerRow = '| ' + headers.map((h, i) => pad(h, widths[i])).join(' | ') + ' |';
+
+  const bodyRows = rows.map(r =>
+    '| ' + r.map((c, i) => pad(c ?? '', widths[i])).join(' | ') + ' |'
+  );
+
+  return [line, headerRow, line, ...bodyRows, line].join('\n');
+}
+
+function formatDelta(curr, prev) {
+  if (curr == null || prev == null) return '-';
+  const delta = curr - prev;
+  const sign = delta > 0 ? '+' : '';
+  return `${sign}${delta.toFixed(1)}`;
+}
+
+function clearScreen() {
+  if (process.stdout.isTTY) {
+    process.stdout.write('\x1b[2J\x1b[H');
+  }
+}
+
+async function collectQuota(accounts, prevMap) {
+  const results = [];
+  const errors = [];
+
+  for (const account of accounts) {
+    try {
+      const accessToken = await refreshToken(account.refresh);
+      const data = await fetchQuota(accessToken, account.projectId);
+      const banDetected = detectBan(JSON.stringify(data));
+
+      if (banDetected) {
+        results.push({
+          email: account.email,
+          projectId: account.projectId,
+          status: 'BANNED',
+          quotas: [],
+        });
+        continue;
+      }
+
+      if (data.models) {
+        const quotas = formatQuota(data.models);
+        results.push({
+          email: account.email,
+          projectId: account.projectId,
+          status: 'OK',
+          quotas,
+        });
+      } else {
+        results.push({
+          email: account.email,
+          projectId: account.projectId,
+          status: 'NO_MODELS',
+          quotas: [],
+        });
+      }
+    } catch (err) {
+      const banDetected = Boolean(err._banDetected);
+      results.push({
+        email: account.email,
+        projectId: account.projectId,
+        status: banDetected ? 'BANNED' : 'ERROR',
+        quotas: [],
+      });
+      errors.push({ email: account.email, message: err.message, raw: err._raw });
+    }
+  }
+
+  const rows = [];
+  const deltaRows = [];
+  const sortedResults = results.map(r => {
+    const opus = r.quotas.find(q => q.model === 'claude-opus-4-5-thinking');
+    return { ...r, opus };
+  }).sort((a, b) => (b.opus?.quota ?? -1) - (a.opus?.quota ?? -1));
+
+  for (const account of sortedResults) {
+    const models = TARGET_MODELS.map(id => {
+      return account.quotas.find(q => q.model === id) || null;
+    });
+
+    if (models.every(m => m === null)) {
+      rows.push([
+        account.email,
+        account.status,
+        '-',
+        '-',
+        '-',
+      ]);
+      continue;
+    }
+
+    models.forEach((model, idx) => {
+      const key = `${account.email}::${model?.model || TARGET_MODELS[idx]}`;
+      const prev = prevMap.get(key);
+      const delta = model ? formatDelta(model.quota, prev) : '-';
+      if (model) prevMap.set(key, model.quota);
+
+      rows.push([
+        idx === 0 ? account.email : '',
+        idx === 0 ? account.status : '',
+        model ? model.modelLabel : (MODEL_LABELS[TARGET_MODELS[idx]] || TARGET_MODELS[idx]),
+        model ? model.quotaStr : '-',
+        delta,
+        model ? model.reset : '-',
+      ]);
+    });
+  }
+
+  return { results: sortedResults, rows, errors };
+}
+
 async function main() {
-  // Find auth profiles
+  if (helpMode) {
+    showHelp();
+    process.exit(0);
+  }
+
   const profilesPath = findAuthProfiles();
-  
   if (!profilesPath) {
-    console.error('❌ No Antigravity auth profiles found.');
-    console.error('   Expected at: ~/.openclaw/agents/main/agent/auth-profiles.json');
-    console.error('   Run `clawdbot configure` to add accounts.');
+    console.error('No Antigravity auth profiles found.');
+    console.error('Expected at: ~/.openclaw/agents/main/agent/auth-profiles.json');
+    console.error('Run `clawdbot configure` to add accounts.');
     process.exit(1);
   }
-  
+
   let profiles;
   try {
     profiles = JSON.parse(fs.readFileSync(profilesPath, 'utf-8'));
   } catch (err) {
-    console.error(`❌ Failed to read auth profiles: ${err.message}`);
+    console.error(`Failed to read auth profiles: ${err.message}`);
     process.exit(1);
   }
-  
+
   const accounts = Object.entries(profiles.profiles || {})
     .filter(([key]) => key.startsWith('google-antigravity:'))
     .map(([key, value]) => ({
@@ -193,107 +359,66 @@ async function main() {
       refresh: value.refresh,
       projectId: value.projectId,
     }));
-  
+
   if (accounts.length === 0) {
-    console.error('❌ No Antigravity accounts found in auth profiles.');
-    console.error('   Run `clawdbot configure` to add accounts.');
+    console.error('No Antigravity accounts found in auth profiles.');
+    console.error('Run `clawdbot configure` to add accounts.');
     process.exit(1);
   }
-  
-  if (!tableMode && !jsonMode) {
-    console.log(`\n📊 Antigravity Quota Check - ${new Date().toISOString()}`);
-    console.log(`⏰ Each model type resets every 5 hours (Claude, Gemini Pro, Flash have separate quotas)`);
-    console.log(`🌍 Times shown in: ${timezone}\n`);
-    console.log(`Found ${accounts.length} account(s)\n`);
-  }
-  
-  const allResults = [];
-  
-  for (const account of accounts) {
-    if (!tableMode && !jsonMode) {
-      console.log(`🔍 ${account.email} (${account.projectId})`);
+
+  const prevMap = new Map();
+
+  const runOnce = async () => {
+    const timestamp = new Date().toISOString();
+    const { results, rows, errors } = await collectQuota(accounts, prevMap);
+
+    if (jsonMode) {
+      console.log(JSON.stringify({
+        timestamp,
+        timezone,
+        accounts: results.map(r => ({
+          email: r.email,
+          projectId: r.projectId,
+          status: r.status,
+          quotas: Object.fromEntries(r.quotas.map(q => [q.model, {
+            remaining: q.quota,
+            reset: q.resetTime,
+          }]))
+        })),
+        errors,
+      }, null, 2));
+      return;
     }
-    
-    try {
-      const accessToken = await refreshToken(account.refresh);
-      const data = await fetchQuota(accessToken, account.projectId);
-      
-      if (data.models) {
-        const quotas = formatQuota(data.models);
-        
-        if (quotas.length > 0) {
-          if (!tableMode && !jsonMode) {
-            for (const q of quotas) {
-              console.log(`   ${q.model}: ${q.quotaStr} (resets ${q.reset})`);
-            }
-          }
-          allResults.push({ email: account.email, projectId: account.projectId, quotas });
-        } else {
-          if (!tableMode && !jsonMode) console.log(`   No quota info available`);
+
+    if (tableMode) {
+      if (watchMode) clearScreen();
+      console.log(`Antigravity Quota Check - ${timestamp}`);
+      console.log(`Timezone: ${timezone}`);
+      console.log(`Accounts: ${accounts.length}`);
+      console.log(`Delta: change since previous refresh`);
+      console.log('');
+
+      const headers = ['Account', 'Status', 'Model', 'Remaining', 'Delta', 'Reset'];
+      console.log(renderTable(headers, rows));
+
+      if (errors.length > 0) {
+        console.log('');
+        console.log('Errors:');
+        for (const e of errors) {
+          console.log(`- ${e.email}: ${e.message}`);
         }
-      } else {
-        if (!tableMode && !jsonMode) console.log(`   No models returned`);
       }
-    } catch (err) {
-      if (!tableMode && !jsonMode) console.log(`   ❌ Error: ${err.message}`);
-      allResults.push({ email: account.email, error: err.message });
     }
-    
-    if (!tableMode && !jsonMode) console.log('');
-  }
-  
-  // Sort by Opus quota descending
-  const sortedResults = allResults
-    .filter(r => !r.error)
-    .map(r => {
-      const opus = r.quotas.find(q => q.model === 'claude-opus-4-5-thinking');
-      return { email: r.email, projectId: r.projectId, opus, quotas: r.quotas };
-    })
-    .filter(r => r.opus)
-    .sort((a, b) => b.opus.quota - a.opus.quota);
-  
-  if (jsonMode) {
-    console.log(JSON.stringify({
-      timestamp: new Date().toISOString(),
-      timezone,
-      accounts: sortedResults.map(r => ({
-        email: r.email,
-        projectId: r.projectId,
-        quotas: Object.fromEntries(r.quotas.map(q => [q.model, { remaining: q.quota, reset: q.resetTime }]))
-      }))
-    }, null, 2));
-  } else if (tableMode) {
-    // Markdown table for tablesnap
-    console.log('| Account | Claude | Reset | Gemini Pro | Reset | Flash | Reset |');
-    console.log('|---------|--------|-------|------------|-------|-------|-------|');
-    
-    for (const r of sortedResults) {
-      const shortEmail = r.email.split('@')[0];
-      const opus = r.quotas.find(q => q.model === 'claude-opus-4-5-thinking');
-      const pro = r.quotas.find(q => q.model === 'gemini-3-pro-high');
-      const flash = r.quotas.find(q => q.model === 'gemini-3-flash');
-      
-      const opusStr = opus ? `${getQuotaEmoji(opus.quota)} ${opus.quotaStr}` : 'N/A';
-      const opusReset = opus ? opus.reset : '-';
-      const proStr = pro ? `${getQuotaEmoji(pro.quota)} ${pro.quotaStr}` : 'N/A';
-      const proReset = pro ? pro.reset : '-';
-      const flashStr = flash ? `${getQuotaEmoji(flash.quota)} ${flash.quotaStr}` : 'N/A';
-      const flashReset = flash ? flash.reset : '-';
-      
-      console.log(`| ${shortEmail} | ${opusStr} | ${opusReset} | ${proStr} | ${proReset} | ${flashStr} | ${flashReset} |`);
-    }
-  } else {
-    // Text summary
-    console.log('─'.repeat(60));
-    console.log('Summary (Claude Opus quota, sorted by remaining):');
-    for (const r of sortedResults) {
-      const emoji = getQuotaEmoji(r.opus.quota);
-      console.log(`  ${emoji} ${r.email}: ${r.opus.quotaStr} (resets ${r.opus.reset})`);
-    }
+  };
+
+  await runOnce();
+
+  if (watchMode) {
+    setInterval(runOnce, REFRESH_MS);
   }
 }
 
 main().catch(err => {
-  console.error(`❌ ${err.message}`);
+  console.error(`Fatal: ${err.message}`);
   process.exit(1);
 });
